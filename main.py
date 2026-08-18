@@ -40,6 +40,7 @@
 # /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 import os
+import re   #IMPORTS PYTHON IN-BUILT "re" (REGULAR EXPRESSION) LIBRARY FOR TEXT SEARCHING
 from google import genai
 from dotenv import load_dotenv
 
@@ -69,6 +70,30 @@ def find_spec_file(protocol_keyword):
         if protocol_keyword in filename.lower():
             return os.path.join(specs_folder, filename)
     return None
+
+def extract_code(ai_text):
+    match = re.search(r'"""(?:systemverilog|sv|verilog)?\n(.*?)\n"""',ai_text,re.DOTALL | re.IGNORECASE)
+    if match:
+        return match.group(1)
+    return ai_text
+
+def validate_sva(code):
+    errors = []
+
+    if code.count('(') != code.count(')'):
+        errors.append("Syntax Error: Unbalanced parantheses '()'.")
+
+    lines = code.split('\n')
+    for i, line in enumerate(lines):
+        clean_line = line.strip()
+        if clean_line.startswith("assert property") and not clean_line.endswith(";"):
+            if "(" in clean_line and clean_line.endswith(")"):
+                errors.append(f"Line {i+1}: Missing semicolon after assertion.")
+
+    if errors:
+        return False, " ".join(errors)
+    return True, "No syntax error detected."
+
 
 try:
     with open(rtl_filename, "r") as file:
@@ -117,14 +142,41 @@ prompt_contents.append(text_prompt)
 
 print(f"\n[*] Analyzing {rtl_filename} and generating assertions... Please wait...")
 
-# E. Make the API Call
-response = client.models.generate_content(
-    model='gemini-3.5-flash', 
-    contents=prompt_contents
-)
+MAX_RETRIES = 3
+success = False
+final_code = ""
+
+for attempt in range(1, MAX_RETRIES + 1):
+    # E. Make the API Call
+    response = client.models.generate_content(
+        model='gemini-3.5-flash',
+        contents=prompt_contents
+    )
+    raw_response = response.text
+    extracted_code = extract_code(raw_response)
+    is_valid, error_msg = validate_sva(extracted_code)
+
+    if is_valid:
+        print(f"[*] Attempt {attempt}: Success! Code passed syntax validation")
+        final_code = extracted_code
+        success = True
+        break
+
+    print(f"[!] Attempt {attempt} Failed Syntax check: {error_msg}")
+    print("[*] Sending Error back to AI for Correction....")
+
+    error_feedback = f"The previous code had the following syntax error: {error_msg}. Please fix it."
+    prompt_contents.append(error_feedback)
 
 print("\n=== AI GENERATED ASSERTIONS ===\n")
-print(response.text)
+
+if success:
+    print(final_code)
+else:
+    print("// AI failed to generate valid code after 3 attempts. Last output:")
+    print(final_code if final_code else raw_response)
+
+
 
 
 
