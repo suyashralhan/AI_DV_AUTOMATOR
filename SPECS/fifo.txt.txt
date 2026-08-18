@@ -1,0 +1,6 @@
+PROTOCOL SPECIFICATION: SYNCHRONOUS FIFO
+Please ensure the SystemVerilog Assertions cover the following critical edge cases:
+1. OVERFLOW: The 'wr_en' signal must never be asserted when the 'full' signal is high.
+2. UNDERFLOW: The 'rd_en' signal must never be asserted when the 'empty' signal is high.
+3. POINTER WRAP: When the write pointer reaches the maximum depth, it must wrap around to 0.
+4. SIMULTANEOUS ACCESS: If 'wr_en' and 'rd_en' are asserted simultaneously when the FIFO is neither full nor empty, the data count should remain unchanged.

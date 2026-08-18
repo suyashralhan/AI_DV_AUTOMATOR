@@ -57,7 +57,7 @@ def detect_protocol(rtl_code):
         return "ahb"
     elif "PSEL" in code or "PENBLE" in code:
         return "apb"
-    elif "WR_EN" in code or "RD_EN" in code:
+    elif "WR_EN" in code or "RD_EN" in code or "FIFO_DATA" in code:
         return "fifo"
     return None
 
