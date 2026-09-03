@@ -2,7 +2,8 @@
 # 1. ENVIRONMENT STEUP & DEPENDENCIES
 # =====================================================
 
-import os                       #USED FOR DIRECTORY SCANNING AND FILE PATH MANAGEMENT               
+import os                       #USED FOR DIRECTORY SCANNING AND FILE PATH MANAGEMENT     
+import subprocess               #IMPORTS PYTHONS INBUILT LIBRARY TO RUN EXTERNAL PROGRAMS (LIKE SLANG) IN THE BACKGROUND         
 import re                       #IMPORTS PYTHON IN-BUILT "re" (REGULAR EXPRESSION) LIBRARY USED TO EXTRACT RAW CODE FROM AI TEXT
 from google import genai        #GOOGLE GEMINI API CLIENT FOR AI TEXT GENERATION
 from dotenv import load_dotenv  #SECURELY LOADS API KEYS FROM HIDDEN .ENV FILE 
@@ -68,32 +69,31 @@ def extract_code(ai_text):
     return ai_text # FALLBACK: RETURN THE ORIGINAL TEXT IF NO MARKDOWN WAS USED
 
 def validate_sva(code):
-    """A LIGHTWEIGHT SYNTAX LINTER THAT SIMULATES AN EDA COMPILER TO CATCH COMMON AI MISTAKES."""
-    errors = []
+    """Uses open-source slang compiler for enterprise- grade SystemVerilog Linting."""
+    temp_filename = "temp_sva.sv"  #DEFINES TEMPORARY FILENAME TO STORE THE AI-GENERATED CODE
 
-    # CHECK 1: ENSURE ALL OPEN PARENTHESES ARE PROPERLY CLOSED
-    # CRITICAL FOR SYSTEMVERILOG ASSERTIONS WHICH RELY ON COMPLEX NESTED LOGIC
-    if code.count('(') != code.count(')'):
-        errors.append("Syntax Error: Unbalanced parantheses '()'.")
+    with open(temp_filename, "w") as f: # OPENS THE TEMPORARY FILE IN WRITE MODE("w")
+        f.write(code)                   # WRITES RAW SYSTEMVERILOG CODE INTO THE FILE FOR COMPILATION
 
-    # CHECK 2: SCAN LINE BY LINE FOR MISSING SEMICOLONS AT THE END OF ASSERTIONS
-    lines = code.split('\n')
-    for i, line in enumerate(lines):
-        clean_line = line.strip() # REMOVE LEADING/TRAILING WHITESPACE
+    try:                   #STARTS TRY-EXCEPT BLOCK TO CATCH SYSTEM ERRORS GRACEFULLY
+        result = subprocess.run(            # EXECUTES AN EXTERNAL COMMAND-LINE PROGRAM FROM WITHIN PYTHON 
+            [r".\slang.exe",temp_filename], # PASSES THE SLANG EXECUTABLE AND OUR TEMP FILE AS COMMAND ARGUMENTS
+            capture_output=True,            # INTERCEPTS THE TERMINAL OUTPUT (ERRORS AND LOGS) INTO MEMORY
+            text=True                       # DECODES THE RAW OUTPUT BYTES INTO A REDABLE PYTHON STRING
+            )                               # CLOSES THE SUBPROCESS EXECUTION BLOCK
 
-    
-        if clean_line.startswith("assert property") and not clean_line.endswith(";"):
-            if "(" in clean_line and clean_line.endswith(")"):
-                errors.append(f"Line {i+1}: Missing semicolon after assertion.")
+        if result.returncode != 0:
+            error_output = result.stderr if result.stderr else result.stdout
+            error_lines = error_output.strip().split('\n')
+            short_error = "\n".join(error_lines[:10])
 
-    # RETURN FALSE AND THE ACCUMULATED ERROR MESSAGES TO TRIGGER THE AI REFLECTION LOOP
-    if errors:
-        return False, " ".join(errors)
-
-    #IF NO ERRORS WERE FOUND, THE CODE IS COMPILER-READY
-    return True, "No syntax error detected."
-
-
+            return False, f"SystemVerilog compilation error:\n{short_error}"
+        return True,   "No syntax error detected."
+    except FileNotFoundError:
+        return False, "[System Error] slang.exe not found."
+    finally:
+        if os.path.exists(temp_filename):
+            os.remove(temp_filename)
 #=============================================================
 # 4. BATCH EXECUTION FLOW
 #=============================================================
