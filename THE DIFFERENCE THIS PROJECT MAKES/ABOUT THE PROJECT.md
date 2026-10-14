@@ -9,6 +9,6 @@ Phase 2: UVM Sequence Item Generation: The engine parses RTL inputs, ignores clo
 
 Agentic Self-Healing Loop: The script integrates the open-source MikePopoloski slang.exe compiler. Instead of just saving the AI's first output, it compiles the code. If the AI hallucinates bad syntax (e.g., uncast default assignments, missing endproperty), Slang throws an IEEE-1800 standard error. The script intercepts this error and feeds it back to the AI for up to 3 autonomous correction attempts before saving the final production-ready file.
 
-2. Immediate Roadmap (What you are adding next)
+2. Immediate Roadmap (What I am planning to add)
 
 Phase 3: Full UVM Boilerplate Generation: Expanding the pipeline to automatically architect the complete scaffolding for a verification environment. By reading the RTL, the tool will generate the Driver, Monitor, Agent, and Environment classes in a single execution, saving days of manual VIP setup time.
