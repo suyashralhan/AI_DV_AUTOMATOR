@@ -1,222 +1,294 @@
-# =====================================================
-# 1. ENVIRONMENT STEUP & DEPENDENCIES
-# =====================================================
+# =====================================================================
+# AI_DV_AUTOMATOR - Enterprise SystemVerilog Assertion & UVM Generator
+# =====================================================================
 
-import os                       #USED FOR DIRECTORY SCANNING AND FILE PATH MANAGEMENT     
-import subprocess               #IMPORTS PYTHONS INBUILT LIBRARY TO RUN EXTERNAL PROGRAMS (LIKE SLANG) IN THE BACKGROUND         
-import re                       #IMPORTS PYTHON IN-BUILT "re" (REGULAR EXPRESSION) LIBRARY USED TO EXTRACT RAW CODE FROM AI TEXT
-from google import genai        #GOOGLE GEMINI API CLIENT FOR AI TEXT GENERATION
-from dotenv import load_dotenv  #SECURELY LOADS API KEYS FROM HIDDEN .ENV FILE 
+import os                         # Handles file path navigation and directory operations
+import subprocess                 # Executes local CLI tools (slang.exe) from Python
+import re                         # Regular expressions for robust code extraction
+import time                       # Manages backoff delays during API rate limits / busy server responses
+from google import genai          # Official Google GenAI SDK client
+from dotenv import load_dotenv    # Loads environment variables from the local .env file
 
-#SECURELYY LOAD ENVIRONMENT VARIABLES FROM HIDDEN .ENV FILE 
-#THIS ENSURES API KEYS ARE NEVER HARDCODED OR EXPOSED IN THE SOURCE CODE
+# ---------------------------------------------------------------------
+# 1. ENVIRONMENT CONFIGURATION & DIRECTORY SETUP
+# ---------------------------------------------------------------------
+
+# Load the secret environment variables (e.g., GEMINI_API_KEY) into system memory
 load_dotenv()
 
-#INITIALIZE THE GEMINI AI CLIENT INSTANCE
-#IT AUTOMATICALLY DETECTS THE API KEY LOADED BY load_dontenv() TO AUTHENTICATE OUR CONNECTION
+# Initialize the Gemini client; automatically picks up the API key from the environment
 client = genai.Client()
 
-#THIS DEFINE STANDARD DIRECTORY PATHS FOR THE BATCH PROCESSING PIPELINE
-RTL_DIR = "rtl"             #INPUT FOLDER CONTAINING RAW VERILOG/SYSTEMVERILOG FILES
-OUTPUT_DIR = "output_svas"  #OUTPUT FOLDER FOR THE GENERATED ASSERTIONS
-SPECS_DIR = "specs"         #FOLDER CONTAINING PROTOCOL SPECIFICATIONS PDFs/TEXT FILES
+# Define project directories for inputs, specifications, and generated outputs
+RTL_DIR    = "rtl"               # Input directory storing RTL design files (.v, .sv)
+SPECS_DIR  = "specs"             # Reference directory for protocol specs (PDF/TXT), style guides, and SVA patterns
+OUTPUT_DIR = "output_svas"       # Output directory for verified SystemVerilog Assertions
+UVM_DIR    = "output_uvm"        # Output directory for generated UVM Sequence Items
 
-#SAFETY CHECK: AUTOMATICALLY CREATE THE OUTPUT DIRECTORY IF IT DOESN'T EXIST TO PREVENT CRASHES
+# Automatically create output directories if they do not exist
 if not os.path.exists(OUTPUT_DIR):
     os.makedirs(OUTPUT_DIR)
 
-#=========================================================
-# 2. THE AUTO-ROUTER ENGINE
-#===========================================================
+if not os.path.exists(UVM_DIR):
+    os.makedirs(UVM_DIR)
+
+# ---------------------------------------------------------------------
+# 2. PROMPT TEMPLATES (PHASE 1 SVA & PHASE 2 UVM)
+# ---------------------------------------------------------------------
+
+# Phase 2 Template: Instructs the LLM to generate production-ready UVM sequence items with CRV constraints
+UVM_PROMPT_TEMPLATE = """You are an expert Design Verification Engineer specializing in UVM and SystemVerilog.
+Your task is to analyze the provided RTL module and generate a production-ready `uvm_sequence_item`.
+
+Follow these strict methodology rules:
+1. Class Setup: Name the class `{module_name}_seq_item` and extend it from `uvm_sequence_item`.
+2. Variables: Declare all input ports from the RTL as `rand` bit/logic variables. Do not include clock ('clk') or output ports.
+3. Factory Registration: Include standard `uvm_object_utils` or `uvm_object_param_utils` (if parameterized).
+4. Constructor: Provide a standard `new(string name = "{module_name}_seq_item")` function.
+5. Constraints: Generate intelligent, protocol-aware `constraint` blocks:
+   - Use soft constraints to keep active-low resets (rst_n / reset_n) de-asserted by default.
+   - Constrain data and control signals using realistic distributions (dist blocks) for corner-case coverage.
+6. Output Format: Output ONLY valid SystemVerilog code wrapped in ```systemverilog markdown. Do not include conversational text.
+
+RTL Code:
+{rtl_code}
+"""
+
+# ---------------------------------------------------------------------
+# 3. PROTOCOL AUTO-ROUTING ENGINE
+# ---------------------------------------------------------------------
 
 def detect_protocol(rtl_code):
-    """PARSES RAW RTL CODE FOR INDUSTRY STANDARD SIGNAL NAMES TO AUTO-DETECT THE HARDWARE PROTOCOL."""
+    """Scans RTL signal names to auto-detect the interface protocol."""
     code = rtl_code.upper()
-    if "AWVALID" in code or "ARVALID" in code or "AWADDR" in code: # DETECT AMBA AXI SIGNALS (VALID/ADDRESS CHANNELS)
-        return "axi"
-    elif "HTRANS" in code or "HREADY" in code or "HADDR" in code:   # DETECT AMBA AHB SIGNALS (TRANSFER/READY/ADDRESS PHASES)
-        return "ahb"
-    elif "PSEL" in code or "PENABLE" in code: # DETECT AMBA APB SIGNALS (SELECT/ENABLE PINS)
-        return "apb" 
-    elif "WR_EN" in code or "RD_EN" in code or "FIFO_DATA" in code: # DETECT GENERIC SYNCHRONOUS/ASYNCHRONOUS FIFO INTERFACES
-        return "fifo"
+    if "AWVALID" in code or "ARVALID" in code or "AWADDR" in code:
+        return "axi"              # Matches ARM AMBA AXI signals
+    elif "HTRANS" in code or "HREADY" in code or "HADDR" in code:
+        return "ahb"              # Matches ARM AMBA AHB signals
+    elif "PSEL" in code or "PENABLE" in code:
+        return "apb"              # Matches ARM AMBA APB signals
+    elif "WR_EN" in code or "RD_EN" in code or "FIFO_DATA" in code:
+        return "fifo"             # Matches Synchronous / Asynchronous FIFO signals
     return None
 
 def find_spec_file(protocol_keyword):
-    """SEARCHES THE SPECS DIRECTORY TO DYNAMICALLY LINK THE DETECTED PROTOCOL TO ITS OFFICIAL DOCUMENTATION."""
-    # SAFETY CHECK TO ENSURE THE SPECS FORLDER EXISTS BEFORE SEARCHING
+    """Searches the specs folder for documentation matching the detected protocol."""
     if not os.path.exists(SPECS_DIR):
-        print("Error: specs folder not found")
+        print(f"[!] Warning: '{SPECS_DIR}' directory not found.")
         return None
-    # SCAN THE FOLDER FOR A PDF OR TEXT FILE THAT MATCHES THE DETECTED PROTOCOL NAME
     for filename in os.listdir(SPECS_DIR):
         if protocol_keyword in filename.lower():
-            # CONSTRUCT AND RETURN THE FULL, SAFE PATH TO THE SPECIFICATION FILE
             return os.path.join(SPECS_DIR, filename)
     return None
 
-#===============================================================
-# 3. THE AUTO-HEALING ENGINE (LINTER & PARSER)
-#===============================================================
+# ---------------------------------------------------------------------
+# 4. COMPILER INTEGRATION & SYNTAX VALIDATION (SLANG ENGINE)
+# ---------------------------------------------------------------------
 
 def extract_code(ai_text):
-    """STRIPS MARKDOWN FORMATTING FROM THE AI RESPONSE TO EXTRACT RAW, COMPILABLE CODE."""
-    # USES REGEX TO FIND CODE BLOCKS MARKED BY '''SYSTEMVERILOG, '''SV, '''VERILOG
-    # re.DOTALL ALLOWS THE SEARCH TO SPAN ACROSS MULTIPLE LINES OF CODE
-    match = re.search(r'"""(?:systemverilog|sv|verilog)?\n(.*?)\n"""', ai_text, re.DOTALL | re.IGNORECASE) 
+    """Extracts raw SystemVerilog code from markdown blocks and strips rogue backticks."""
+    # Match code inside standard ```systemverilog ... ``` blocks across multiple lines
+    match = re.search(r'```(?:systemverilog|sv|verilog|v)?\s*(.*?)```', ai_text, re.DOTALL | re.IGNORECASE)
     if match:
-        return match.group(1) # RETURN ONLY THE RAW CODE FOUND INSIDE THE BACKTICKS
-    return ai_text # FALLBACK: RETURN THE ORIGINAL TEXT IF NO MARKDOWN WAS USED
+        clean_code = match.group(1).strip()
+    else:
+        clean_code = ai_text.strip()
 
-def validate_sva(code):
-    """Uses open-source slang compiler for enterprise- grade SystemVerilog Linting."""
-    temp_filename = "temp_sva.sv"  #DEFINES TEMPORARY FILENAME TO STORE THE AI-GENERATED CODE
+    # Failsafe cleanup: Remove any residual markdown fence artifacts that could trip compiler macros
+    clean_code = clean_code.replace("```systemverilog", "")
+    clean_code = clean_code.replace("```sv", "")
+    clean_code = clean_code.replace("```verilog", "")
+    clean_code = clean_code.replace("```", "")
+    return clean_code.strip()
 
-    with open(temp_filename, "w") as f: # OPENS THE TEMPORARY FILE IN WRITE MODE("w")
-        f.write(code)                   # WRITES RAW SYSTEMVERILOG CODE INTO THE FILE FOR COMPILATION
+def validate_sva(code, rtl_filepath):
+    """Compiles the generated SVA against the RTL module using Slang to catch IEEE 1800 syntax violations."""
+    temp_filename = "temp_sva.sv"
 
-    try:                   #STARTS TRY-EXCEPT BLOCK TO CATCH SYSTEM ERRORS GRACEFULLY
-        result = subprocess.run(            # EXECUTES AN EXTERNAL COMMAND-LINE PROGRAM FROM WITHIN PYTHON 
-            [r".\slang.exe",temp_filename], # PASSES THE SLANG EXECUTABLE AND OUR TEMP FILE AS COMMAND ARGUMENTS
-            capture_output=True,            # INTERCEPTS THE TERMINAL OUTPUT (ERRORS AND LOGS) INTO MEMORY
-            text=True                       # DECODES THE RAW OUTPUT BYTES INTO A REDABLE PYTHON STRING
-            )                               # CLOSES THE SUBPROCESS EXECUTION BLOCK
+    # Write the SVA to a temporary file
+    with open(temp_filename, "w") as f:
+        f.write(code)
 
+    try:
+        # Run Slang passing BOTH the RTL file and the SVA file to resolve port lists and bind statements
+        result = subprocess.run(
+            [r".\slang.exe", rtl_filepath, temp_filename],
+            capture_output=True,
+            text=True
+        )
+
+        # Check compiler exit status
         if result.returncode != 0:
             error_output = result.stderr if result.stderr else result.stdout
             error_lines = error_output.strip().split('\n')
-            short_error = "\n".join(error_lines[:10])
-
+            short_error = "\n".join(error_lines[:10])  # Capture top 10 compiler error lines
             return False, f"SystemVerilog compilation error:\n{short_error}"
-        return True,   "No syntax error detected."
+
+        return True, "No syntax error detected."
+
     except FileNotFoundError:
-        return False, "[System Error] slang.exe not found."
+        return False, "[SYSTEM ERROR] slang.exe not found in working directory."
     finally:
+        # Guarantee cleanup of temporary testbench files
         if os.path.exists(temp_filename):
             os.remove(temp_filename)
-#=============================================================
-# 4. BATCH EXECUTION FLOW
-#=============================================================
-# CHECK: ENSURE INPUT DIRECTORY EXISTS BEFORE STARTING
+
+# ---------------------------------------------------------------------
+# 5. MASTER EXECUTION PIPELINE
+# ---------------------------------------------------------------------
+
 if not os.path.exists(RTL_DIR):
-    print(f"[!] Error: '{RTL_DIR}' Directory not found. Please create it and add your .v files.")
+    print(f"[!] Error: '{RTL_DIR}' directory not found. Please create it and add RTL files.")
     exit()
 
-
-# USE A LIST COMPREHENSION TO SCAN THE DIRECTORY AND FILTER FOR VERILOG/SYSTEMVERILOG FILES ONLY
 rtl_files = [f for f in os.listdir(RTL_DIR) if f.endswith('.v') or f.endswith('.sv')]
 
-# EXIT IF THE FOLDER IS EMPTY TO PREVENT CRASHES
 if not rtl_files:
-    print(f"[!] No Verilog files found in '{RTL_DIR}'.")
+    print(f"[!] No Verilog/SystemVerilog files found in '{RTL_DIR}'.")
     exit()
 
-print(f"[*] Found {len(rtl_files)} files to process. Starting Batch Execution..\n")
+print(f"[*] Found {len(rtl_files)} files to process. Starting batch execution...\n")
 
-#THE MASTER LOOP: PROCESS EACH RTL FILE AUTONOMOUSLY, ONE BY ONE
 for filename in rtl_files:
-    rtl_filepath = os.path.join(RTL_DIR, filename) # CONSTRUCRT SAFE FILE PATH
+    rtl_filepath = os.path.join(RTL_DIR, filename)
 
-    print("="*60)
+    print("=" * 60)
     print(f"[*] PROCESSING: {filename}")
-    print("="*60)
+    print("=" * 60)
 
-    # READ RAW VERILOG SOURCE CODE INTO MEMORY
+    # Read design source code
     with open(rtl_filepath, "r") as file:
         verilog_code = file.read()
 
-    # TRIGGER AUTO-ROUTER ENGINE TO INDENTIFY THE IP BLOCK
+    # Detect protocol and build prompt context
     detected_protocol = detect_protocol(verilog_code)
     spec_file_path = None
     prompt_contents = []
 
     if detected_protocol:
-        print(f"[*] Auto_detected Protocol: {detected_protocol.upper()}")
-        spec_file_path = find_spec_file(detected_protocol) # FIND THE MATCHING OFFICIAL INDUSTRY RULEBOOK FOR THE DESIGN
+        print(f"[*] Auto-detected Protocol: {detected_protocol.upper()}")
+        spec_file_path = find_spec_file(detected_protocol)
 
     if spec_file_path:
         print(f"[*] Found spec file: {spec_file_path}")
         if spec_file_path.endswith(".pdf"):
-            print("[*] Uploading PDF to Gemini File API...")
-            uploaded_pdf = client.files.upload(file=spec_file_path) # LEVERAGE GOOGLE'S FILE API TO HANDLE MASSIVE, MULTI-PAGE PDF'S
+            print("[*] Uploading PDF specification to Gemini File API...")
+            uploaded_pdf = client.files.upload(file=spec_file_path)
             prompt_contents.append(uploaded_pdf)
         elif spec_file_path.endswith(".txt"):
             with open(spec_file_path, "r") as file:
                 text_rules = file.read()
-                prompt_contents.append(f"=== PROTOCOL RULES ===\n{text_rules}") # INJECT RAW TEXT RULES DIRECLTY INTO THE PROMPT CONTEXT
+            prompt_contents.append(f"=== PROTOCOL RULES ===\n{text_rules}")
     else:
         print("[!] No specific protocol document found. Generating standard SVAs.")
 
-# INSTRUCT THE AI TO ACT AS DV ENGINEER AND STRICLTY FOLLOW THE PROTOCOL SPECIFICATIONS
+    # Phase 1 SVA System Prompt
     text_prompt = f"""You are an expert Design Verification Engineer.
 I have provided the Verilog RTL below. If a protocol specification is attached or provided,
 generate strict SystemVerilog Assertions (SVA) that verify those specific rules.
 Otherwise, generate standard SVAs for basic digital logic checks (overflow, resets, etc.).
 
-Only output System Verilog code with comments explaining each assertion. Do not include any other text.
+Only output SystemVerilog code with comments explaining each assertion. Do not include any other text.
 
 === VERILOG RTL ===
 {verilog_code}
 """
     prompt_contents.append(text_prompt)
 
+    # -----------------------------------------------------------------
+    # PHASE 1: SELF-HEALING ASSERTION GENERATION LOOP
+    # -----------------------------------------------------------------
     print(f"\n[*] Analyzing {filename} and generating assertions... Please wait...")
 
-    # AUTO-HEALING LOOP
-    MAX_RETRIES = 3 # PREVENT INFINITE LOOPS; GIVE AI 3 CHNACES TO FIX SYNTAX ERRORS
+    MAX_RETRIES = 3
     success = False
     final_code = ""
     raw_response = ""
 
     for attempt in range(1, MAX_RETRIES + 1):
-        # CALL THE GEMINI MODEL WITH THE FULL CONTEXT (RTL + SPECS + PROMPT + ERROR HISTORHY)
-        response = client.models.generate_content(
-            model='gemini-3.5-flash',
-            contents=prompt_contents
-        )
-        raw_response = response.text
-        # STRIP AWAY THE CONVERSATIONAL FILTER TO ISOLATE THE SYSTEMVERILOG CODE
+        # Resilient API call loop to absorb server congestion (503/429) without losing retry attempts
+        while True:
+            try:
+                response = client.models.generate_content(
+                    model='gemini-3.5-flash',
+                    contents=prompt_contents
+                )
+                raw_response = response.text
+                break
+            except Exception as e:
+                if "503" in str(e) or "429" in str(e):
+                    print("[!] Gemini API is busy. Waiting 10 seconds before retrying...")
+                    time.sleep(10)
+                else:
+                    raise e
+
+        # Extract code and clean backticks
         extracted_code = extract_code(raw_response)
 
-        #-------- DEMO SABOTAGE ------------
-        # ARTIFICIALLY REMOVES THE FIRST SEMICOLON IN ATTEMPT 1 TO TRIGGER THE AUTO HEALER
-        if attempt == 1:
-            extracted_code = extracted_code.replace(")","",1)
-        #--------------------------------------------
-
-        # RUN THE EXTRACTED CODE THROUGH OUR CUSTOM EDA SYNTAX LINTER
-        is_valid, error_msg = validate_sva(extracted_code)
+        # Validate with Slang (cross-referencing the RTL file)
+        is_valid, error_msg = validate_sva(extracted_code, rtl_filepath)
 
         if is_valid:
-            print(f"[*] Attempt {attempt}: Success! Code passed syntax validation")
+            print(f"[*] Attempt {attempt}: Success! Code passed syntax validation.")
             final_code = extracted_code
             success = True
-            break #EXIT LOOP IMMEDIATELY UPON SUCCESS
+            break
 
-        # ERROR FEEDBACK INJECTION
         print(f"[!] Attempt {attempt} Failed Syntax check: {error_msg}")
-        print("[*] Sending Error back to AI for Correction....")
+        print("[*] Sending compiler error back to AI for autonomous correction...")
 
-        # APPEND THE SPECIFIC COMPILER ERROR BACK INTO THE AI's CONTEXT WINDOW SO IT LEARNS ND ADAPTS
-        error_feedback = f"The previous code had the following syntax error: {error_msg}. Please fix it."
+        # Feedback loop: Append compiler diagnostics back into the conversation context
+        error_feedback = f"The previous code had the following syntax error:\n{error_msg}\nPlease fix it."
         prompt_contents.append(error_feedback)
 
-    # AUTOMATED OUTPUT ROUTING
-    # DYNAMICALLY GENERATE THE OUTPUT FILENAME
+    # Save Phase 1 SVA output
     output_filename = f"{filename.split('.')[0]}_sva.sv"
     output_filepath = os.path.join(OUTPUT_DIR, output_filename)
 
-    # OPEN THE TARGET FILE IN WRITE MODE
     with open(output_filepath, "w") as out_file:
         if success:
-            # SAVE THE VALIDATED, PRODUCTION-READY ASSERTIONS
             out_file.write(final_code)
             print(f"[*] Wrote valid assertions to: {output_filepath}\n")
         else:
-            # FALLBACK: SAVE THE FAILED ATTEMPT FOR MANUAL DEBUGGING
-            out_file.write("// AI Failed to generate valid code after 3 attemps. Last output:\n")
-            out_file.write(final_code if final_code else raw_response )
+            out_file.write("// AI Failed to generate valid code after 3 attempts. Last output:\n")
+            out_file.write(final_code if final_code else raw_response)
             print(f"[!] Wrote failed attempt to: {output_filepath}\n")
-    
 
+    # -----------------------------------------------------------------
+    # PHASE 2: UVM SEQUENCE ITEM & CONSTRAINT GENERATION
+    # -----------------------------------------------------------------
+    print(f"[*] Generating UVM Sequence Item with constraints for {filename}...")
 
+    uvm_prompt = UVM_PROMPT_TEMPLATE.format(
+        module_name=filename.split('.')[0],
+        rtl_code=verilog_code
+    )
+
+    MAX_API_RETRIES = 3
+    uvm_response = None
+
+    for api_attempt in range(1, MAX_API_RETRIES + 1):
+        try:
+            uvm_response = client.models.generate_content(
+                model='gemini-3.5-flash',
+                contents=uvm_prompt
+            )
+            break
+        except Exception as e:
+            if "503" in str(e) or "429" in str(e):
+                print(f"[!] Gemini API is busy. Retrying UVM Generation in 10s... (Attempt {api_attempt}/{MAX_API_RETRIES})")
+                time.sleep(10)
+                if api_attempt == MAX_API_RETRIES:
+                    print("[!] API completely unavailable. Skipping UVM generation for this file.")
+            else:
+                raise e
+
+    if uvm_response:
+        uvm_code = extract_code(uvm_response.text)
+        uvm_filename = f"{filename.split('.')[0]}_seq_item.sv"
+        uvm_filepath = os.path.join(UVM_DIR, uvm_filename)
+
+        with open(uvm_filepath, "w") as f:
+            f.write(uvm_code)
+
+        print(f"[*] Wrote UVM Sequence Item to: {uvm_filepath}\n")
